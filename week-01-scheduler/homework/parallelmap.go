@@ -4,7 +4,11 @@
 // parallel, with a bound on how many calls run at once.
 package parallelmap
 
-import "context"
+import (
+	"context"
+	"sync"
+	"sync/atomic"
+)
 
 // Map calls f on every element of in and returns the results in order:
 // out[i] is the result of f(ctx, in[i]). f is called exactly once per element.
@@ -32,5 +36,67 @@ import "context"
 //
 // workers > len(in) is allowed. ctx must not be nil, and f must not panic.
 func Map[T, R any](ctx context.Context, in []T, workers int, f func(context.Context, T) (R, error)) ([]R, error) {
-	panic("parallelmap: Map is not implemented")
+	if workers < 1 {
+		panic("parallelmap: workers must be at least 1")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(in) == 0 {
+		return []R{}, nil
+	}
+
+	newCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	n := workers
+	if n > len(in) {
+		n = len(in)
+	}
+	out := make([]R, len(in))
+
+	var (
+		nexti atomic.Int64
+		wg    sync.WaitGroup
+		err1  sync.Once
+		ferr  error
+	)
+	catchError := func(err error) {
+		err1.Do(func() {
+			ferr = err
+			cancel()
+		})
+	}
+	wg.Add(n)
+	for range n {
+		go func() {
+			defer wg.Done()
+			for {
+				if newCtx.Err() != nil {
+					return
+				}
+				idx := int(nexti.Add(1) - 1)
+				if idx >= len(in) {
+					return
+				}
+				if newCtx.Err() != nil {
+					return
+				}
+				res, err := f(newCtx, in[idx])
+				if err != nil {
+					catchError(err)
+					return
+				}
+				out[idx] = res
+			}
+		}()
+	}
+	wg.Wait()
+
+	if ferr != nil {
+		return nil, ferr
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
